@@ -1,0 +1,45 @@
+#!/bin/zsh
+# ask — LLM 챗 + {MODE:xxx} 프롬프트 프리셋 치환 (prompt-dress)
+# 사용: ask "{MODE:coder} 이 함수 리팩터링해줘"
+#       ask -m <모델ID> "{MODE:logic} ..."
+# 설정: 환경변수로 오버라이드 가능 — ASK_BASE_URL (기본 http://localhost:8000/v1)
+#       ASK_API_KEY (기본 local), ASK_MODEL (기본 mlx-community--Qwen3.6-35B-A3B-4bit)
+
+MODEL="${ASK_MODEL:-mlx-community--Qwen3.6-35B-A3B-4bit}"
+BASE_URL="${ASK_BASE_URL:-http://localhost:8000}"
+API_KEY="${ASK_API_KEY:-local}"
+PROMPT="$*"
+# 모드 파일: 스크립트와 같은 디렉토리 우선, 없으면 ~/.config/llm-modes/
+SCRIPT_DIR="${0:A:h}"
+if [ -f "$SCRIPT_DIR/modes.md" ]; then MODE_FILE="$SCRIPT_DIR/modes.md"; else MODE_FILE="$HOME/.config/llm-modes/modes.md"; fi
+
+# -m 옵션 파싱
+if [[ "$1" == "-m" ]]; then MODEL="$2"; shift 2; PROMPT="$*"; fi
+
+# {MODE:xxx} 태그 추출 → 시스템 프롬프트 치환
+SYSTEM=""
+TAG=$(echo "$PROMPT" | grep -oE '\{MODE:[a-z]+\}' | head -1 | sed 's/{MODE://;s/}//')
+if [ -n "$TAG" ]; then
+  PROMPT=$(echo "$PROMPT" | sed "s/{MODE:$TAG}[[:space:]]*//")
+  BLOCK=$(awk -v t="[$TAG]" '
+    $0 == t {found=1; next}
+    found && /^\[/ {exit}
+    found {print}
+  ' "$MODE_FILE" | sed '/^#/d;/^$/d')
+  if [ -n "$BLOCK" ]; then SYSTEM="$BLOCK"; else echo "모드 '$TAG' 없음. 목록: $(grep -oE '^\[[a-z]+\]' $MODE_FILE | tr -d '[]' | tr '\n' ' ')" >&2; exit 1; fi
+fi
+
+# JSON 조립 (python으로 안전하게)
+python3 - "$MODEL" "$SYSTEM" "$PROMPT" << 'EOF' | curl -s --max-time 600 "$BASE_URL/v1/chat/completions" \
+  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" -d @- | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+if 'error' in d: print('ERROR:', d['error']['message'][:200]); sys.exit(1)
+print(d['choices'][0]['message'].get('content',''))"
+import json,sys
+model, system, prompt = sys.argv[1], sys.argv[2], sys.argv[3]
+msgs=[]
+if system: msgs.append({"role":"system","content":system})
+msgs.append({"role":"user","content":prompt})
+print(json.dumps({"model":model,"messages":msgs,"max_tokens":4000,"temperature":0.6}, ensure_ascii=False))
+EOF
